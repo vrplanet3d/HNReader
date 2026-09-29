@@ -1,17 +1,17 @@
 using System.Collections.Concurrent;
 using System.Net.Http.Json;
 using System.Text.Json;
+using Microsoft.Extensions.Options;
 
 namespace HNReader.Api.Stories;
 
 public sealed class BestStoriesService(
     IHttpClientFactory httpClientFactory,
     TimeProvider clock,
-    ILogger<BestStoriesService> logger)
+    ILogger<BestStoriesService> logger,
+    IOptions<BestStoriesOptions> options)
 {
-    private static readonly TimeSpan FreshFor = TimeSpan.FromMinutes(5);
-    private static readonly TimeSpan StaleFor = TimeSpan.FromMinutes(15);
-    private static readonly TimeSpan RetryAfterFailure = TimeSpan.FromMinutes(1);
+    private readonly BestStoriesOptions _settings = options.Value;
     private readonly SemaphoreSlim _refreshLock = new(1, 1);
     private Snapshot? _snapshot;
     private DateTimeOffset _nextAttempt;
@@ -45,14 +45,14 @@ public sealed class BestStoriesService(
             {
                 var stories = await LoadStoriesAsync();
                 now = clock.GetUtcNow();
-                snapshot = new Snapshot(stories, now + FreshFor, now + FreshFor + StaleFor);
+                snapshot = new Snapshot(stories, now + _settings.FreshFor, now + _settings.FreshFor + _settings.StaleFor);
                 Volatile.Write(ref _snapshot, snapshot);
                 return stories.Take(n).ToArray();
             }
             catch (Exception ex) when (ex is HttpRequestException or JsonException or OperationCanceledException)
             {
                 now = clock.GetUtcNow();
-                _nextAttempt = now + RetryAfterFailure;
+                _nextAttempt = now + _settings.RetryAfterFailure;
                 logger.LogWarning(ex, "Unable to refresh Hacker News best stories");
                 if (snapshot?.StaleUntil > now)
                     return snapshot.Stories.Take(n).ToArray();
@@ -68,14 +68,14 @@ public sealed class BestStoriesService(
     private async Task<BestStory[]> LoadStoriesAsync()
     {
         using var client = httpClientFactory.CreateClient("HackerNews");
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var timeout = new CancellationTokenSource(_settings.RefreshTimeout);
 
         var ids = await client.GetFromJsonAsync<int[]>("beststories.json", timeout.Token)
             ?? throw new JsonException("Hacker News returned a null best stories list.");
 
         var stories = new ConcurrentBag<(int Id, BestStory Story)>();
         await Parallel.ForEachAsync(ids.Distinct(),
-            new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = timeout.Token },
+            new ParallelOptions { MaxDegreeOfParallelism = _settings.MaxConcurrentRequests, CancellationToken = timeout.Token },
             async (id, cancellationToken) =>
             {
                 var item = await client.GetFromJsonAsync<HackerNewsItem>($"item/{id}.json", cancellationToken);

@@ -3,6 +3,7 @@ using HNReader.Api.Stories;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 
 var tests = new (string Name, Func<Task> Run)[]
 {
@@ -17,6 +18,9 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Invalid story time without saved results", RejectsInvalidTimeWithoutSavedResults),
     ("Invalid story time keeps the last good results", UsesSavedResultsForInvalidTime),
     ("Limits concurrent Hacker News requests", LimitsConcurrency),
+    ("Configured cache and retry times", UsesConfiguredCacheTimes),
+    ("Configured Hacker News request timeout", UsesConfiguredRequestTimeout),
+    ("Configured overall update deadline", UsesConfiguredRefreshTimeout),
     ("Rejects invalid n", RejectsInvalidN)
 };
 
@@ -38,8 +42,22 @@ foreach (var (name, run) in tests)
 Console.WriteLine($"{tests.Length - failures}/{tests.Length} passed");
 return failures == 0 ? 0 : 1;
 
-static BestStoriesService CreateService(StubHandler handler, ManualClock? clock = null) =>
-    new(new StubFactory(handler), clock ?? new ManualClock(), NullLogger<BestStoriesService>.Instance);
+static BestStoriesOptions DefaultOptions() => new()
+{
+    FreshFor = TimeSpan.FromMinutes(5),
+    StaleFor = TimeSpan.FromMinutes(15),
+    RetryAfterFailure = TimeSpan.FromMinutes(1),
+    RequestTimeout = TimeSpan.FromSeconds(10),
+    RefreshTimeout = TimeSpan.FromSeconds(30),
+    MaxConcurrentRequests = 8
+};
+
+static BestStoriesService CreateService(StubHandler handler, ManualClock? clock = null, BestStoriesOptions? settings = null)
+{
+    settings ??= DefaultOptions();
+    return new BestStoriesService(new StubFactory(handler, settings.RequestTimeout), clock ?? new ManualClock(),
+        NullLogger<BestStoriesService>.Instance, Options.Create(settings));
+}
 
 static void Check(bool condition, string message)
 {
@@ -280,6 +298,14 @@ static async Task<HackerNewsUnavailableException> ExpectUnavailable(BestStoriesS
 
 static async Task LimitsConcurrency()
 {
+    await CheckConcurrency(8);
+    await CheckConcurrency(2);
+}
+
+static async Task CheckConcurrency(int limit)
+{
+    var settings = DefaultOptions();
+    settings.MaxConcurrentRequests = limit;
     var active = 0;
     var maximum = 0;
     using var handler = new StubHandler(async (path, token) =>
@@ -297,9 +323,78 @@ static async Task LimitsConcurrency()
         }
         finally { Interlocked.Decrement(ref active); }
     });
-    var stories = await CreateService(handler).GetBestStoriesAsync(24);
-    Check(stories.Count == 24 && maximum is > 1 and <= 8,
-        $"Expected 2–8 concurrent item requests, observed {maximum}");
+    var stories = await CreateService(handler, settings: settings).GetBestStoriesAsync(24);
+    Check(stories.Count == 24 && maximum > 1 && maximum <= limit,
+        $"Expected 2–{limit} concurrent item requests, observed {maximum}");
+}
+
+static async Task UsesConfiguredCacheTimes()
+{
+    var settings = DefaultOptions();
+    settings.FreshFor = TimeSpan.FromSeconds(2);
+    settings.StaleFor = TimeSpan.FromSeconds(8);
+    settings.RetryAfterFailure = TimeSpan.FromSeconds(3);
+    var clock = new ManualClock();
+    var unavailable = false;
+    using var handler = new StubHandler((path, _) =>
+    {
+        if (unavailable) throw new HttpRequestException("Hacker News unavailable");
+        return Task.FromResult(StubHandler.Json(path.EndsWith("beststories.json") ? "[1]" :
+            StubHandler.Story(10, "Saved")));
+    });
+    var service = CreateService(handler, clock, settings);
+    await service.GetBestStoriesAsync(1);
+    clock.Advance(TimeSpan.FromSeconds(1));
+    Check((await service.GetBestStoriesAsync(1))[0].Title == "Saved" && handler.Calls == 2,
+        "FreshFor should control how long results are reused");
+
+    unavailable = true;
+    clock.Advance(TimeSpan.FromSeconds(2));
+    Check((await service.GetBestStoriesAsync(1))[0].Title == "Saved" && handler.Calls == 3,
+        "The first failed update should return saved results");
+    clock.Advance(TimeSpan.FromSeconds(2));
+    Check((await service.GetBestStoriesAsync(1))[0].Title == "Saved" && handler.Calls == 3,
+        "RetryAfterFailure should delay another update");
+    clock.Advance(TimeSpan.FromSeconds(2));
+    Check((await service.GetBestStoriesAsync(1))[0].Title == "Saved" && handler.Calls == 4,
+        "RetryAfterFailure should permit another update after the delay");
+    clock.Advance(TimeSpan.FromSeconds(4));
+    await ExpectUnavailable(service);
+    Check(handler.Calls == 5, "StaleFor should stop serving saved results when they expire");
+}
+
+static async Task UsesConfiguredRequestTimeout()
+{
+    var settings = DefaultOptions();
+    settings.RequestTimeout = TimeSpan.FromMilliseconds(40);
+    settings.RefreshTimeout = TimeSpan.FromSeconds(5);
+    using var handler = new StubHandler(async (_, token) =>
+    {
+        await Task.Delay(Timeout.InfiniteTimeSpan, token);
+        return StubHandler.Json("[1]");
+    });
+    var service = CreateService(handler, settings: settings);
+    var error = await ExpectUnavailable(service).WaitAsync(TimeSpan.FromSeconds(2));
+    Check(error.InnerException is OperationCanceledException && handler.Calls == 1,
+        "RequestTimeout should cancel a slow Hacker News request");
+}
+
+static async Task UsesConfiguredRefreshTimeout()
+{
+    var settings = DefaultOptions();
+    settings.RequestTimeout = TimeSpan.FromSeconds(1);
+    settings.RefreshTimeout = TimeSpan.FromMilliseconds(1100);
+    settings.MaxConcurrentRequests = 1;
+    using var handler = new StubHandler(async (path, token) =>
+    {
+        if (path.EndsWith("beststories.json")) return StubHandler.Json("[1,2]");
+        await Task.Delay(TimeSpan.FromMilliseconds(700), token);
+        return StubHandler.Json(StubHandler.Story(10, path));
+    });
+    var service = CreateService(handler, settings: settings);
+    var error = await ExpectUnavailable(service).WaitAsync(TimeSpan.FromSeconds(3));
+    Check(error.InnerException is OperationCanceledException && handler.Calls == 3,
+        "RefreshTimeout should stop the whole update even when individual requests are fast enough");
 }
 
 static async Task RejectsInvalidN()

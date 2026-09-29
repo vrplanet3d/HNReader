@@ -96,6 +96,33 @@ Values of `pretty` other than `true` or `false` return HTTP 400.
   causing a matching surge of requests to Hacker News. Each running copy of
   this app has its own saved list, which is not shared with other servers.
 
+## Configuration
+
+The `BestStories` section in `src/HNReader.Api/appsettings.json` controls these
+settings. The behavior above uses the following defaults:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `FreshFor` | `00:05:00` | Time before a saved list needs updating. |
+| `StaleFor` | `00:15:00` | Additional time to serve the last good list while updates fail. |
+| `RetryAfterFailure` | `00:01:00` | Minimum delay before retrying a failed update. |
+| `RequestTimeout` | `00:00:10` | Timeout for each Hacker News HTTP request. |
+| `RefreshTimeout` | `00:00:30` | Deadline for one complete list update. |
+| `MaxConcurrentRequests` | `8` | Maximum simultaneous story detail requests per app copy. |
+
+Duration settings use `hh:mm:ss` (or a .NET `TimeSpan` string). Override them
+without editing code using environment variables, for example
+`BestStories__FreshFor=00:10:00 dotnet run --project src/HNReader.Api --launch-profile http`
+on macOS or Linux. On Windows PowerShell, set `BestStories__FreshFor` in the
+shell before running the same `dotnet run` command. Environment variables
+override `appsettings.json`. Restart the app after changing a setting.
+
+All durations must be positive. `RefreshTimeout` must be at least
+`RequestTimeout`. The settings have upper bounds, and `MaxConcurrentRequests`
+must be between 1 and 32. Invalid settings prevent the app from starting.
+Increasing concurrency or shortening the cache interval can raise the load on
+Hacker News, especially when running multiple app copies.
+
 ## Roadmap
 
 These items are ordered for a public deployment with one running copy of the app.
@@ -122,9 +149,8 @@ The last two apply only if the deployment needs them.
      investigated. Error reporting alone would not show a stopped update job.
    - Add a health check endpoint so the hosting platform can tell whether the
      app is responding. If a scheduled job is added, monitor that it still runs.
-5. Make the app easier to tune for higher traffic.
-   - Allow timeouts and cache times to be changed without editing code. Test
-     how the app behaves with many callers at once.
+5. Test how the app behaves with many callers at once, then tune the configurable
+   cache times, timeouts, and concurrency limit if needed.
 6. Add OpenAPI documentation describing the API and its responses.
 7. If running more than one copy of the app, use one scheduled update job and
    a shared cache such as Redis.

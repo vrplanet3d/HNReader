@@ -26,11 +26,12 @@ internal sealed class StubHandler(Func<string, CancellationToken, Task<HttpRespo
         });
 }
 
-internal sealed class StubFactory(HttpMessageHandler handler) : IHttpClientFactory
+internal sealed class StubFactory(HttpMessageHandler handler, TimeSpan requestTimeout) : IHttpClientFactory
 {
     public HttpClient CreateClient(string name) => new(handler, disposeHandler: false)
     {
-        BaseAddress = new Uri("https://hacker-news.firebaseio.com/v0/")
+        BaseAddress = new Uri("https://hacker-news.firebaseio.com/v0/"),
+        Timeout = requestTimeout
     };
 }
 
