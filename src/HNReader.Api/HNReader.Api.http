@@ -1,0 +1,11 @@
+@HNReader.Api_HostAddress = https://localhost:7169
+
+GET {{HNReader.Api_HostAddress}}/api/stories/best?n=10
+Accept: application/json
+
+###
+
+GET {{HNReader.Api_HostAddress}}/api/stories/best?n=10&pretty=true
+Accept: application/json
+
+###
