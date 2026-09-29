@@ -10,4 +10,6 @@ public sealed class BestStoriesOptions
     public TimeSpan RequestTimeout { get; set; }
     public TimeSpan RefreshTimeout { get; set; }
     public int MaxConcurrentRequests { get; set; }
+    public int CircuitBreakerFailureThreshold { get; set; }
+    public TimeSpan CircuitBreakerOpenFor { get; set; }
 }

@@ -17,6 +17,10 @@ builder.Services.AddOptions<BestStoriesOptions>()
         "BestStories:RefreshTimeout must be at least RequestTimeout and no more than 1 hour.")
     .Validate(o => o.MaxConcurrentRequests is >= 1 and <= 32,
         "BestStories:MaxConcurrentRequests must be between 1 and 32.")
+    .Validate(o => o.CircuitBreakerFailureThreshold is >= 1 and <= 100,
+        "BestStories:CircuitBreakerFailureThreshold must be between 1 and 100.")
+    .Validate(o => o.CircuitBreakerOpenFor >= o.RetryAfterFailure && o.CircuitBreakerOpenFor <= TimeSpan.FromDays(1),
+        "BestStories:CircuitBreakerOpenFor must be at least RetryAfterFailure and no more than 1 day.")
     .ValidateOnStart();
 
 builder.Services.AddSingleton(TimeProvider.System);

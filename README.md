@@ -66,7 +66,7 @@ Add `pretty=true` to make the JSON easier to read, for example
 compact JSON. Both formats contain the same stories in the same order.
 If `n` is missing, not a number, zero, or negative, the API returns HTTP 400.
 If `n` is larger than the number of available stories, it returns all of them.
-If Hacker News is unavailable and the API has no saved results to use, it
+If a refresh fails or is paused and the API has no usable saved results, it
 returns HTTP 503.
 Values of `pretty` other than `true` or `false` return HTTP 400.
 
@@ -87,10 +87,14 @@ Values of `pretty` other than `true` or `false` return HTTP 400.
     8 stories at once, allows 10 seconds for each HTTP request, and allows up
     to 30 seconds for the whole update. Other callers can use the last saved
     list while the update is running, as long as that list is not too old.
-  - If an update fails, the app waits one minute before trying again. It can
-    keep returning the previous list for 15 more minutes after the initial
-    five minutes. After that it returns HTTP 503 until Hacker News is available
-    again. The results are not guaranteed to be current at every moment.
+  - If an update fails, the app waits one minute before trying again. After
+    three consecutive failed updates, a circuit breaker pauses updates for
+    five minutes. The next request after the pause can trigger one trial update.
+    A successful update resets the failure count, while another failure starts
+    a new five-minute pause.
+    The app can keep returning the previous list for 15 more minutes after the
+    initial five minutes. After that it returns HTTP 503 until an update
+    succeeds. The results are not guaranteed to be current at every moment.
 - Hacker News does not publish a rate limit for its API. Saving results and
   running only one update at a time stops a surge of requests to this API from
   causing a matching surge of requests to Hacker News. Each running copy of
@@ -109,6 +113,8 @@ settings. The behavior above uses the following defaults:
 | `RequestTimeout` | `00:00:10` | Timeout for each Hacker News HTTP request. |
 | `RefreshTimeout` | `00:00:30` | Deadline for one complete list update. |
 | `MaxConcurrentRequests` | `8` | Maximum simultaneous story detail requests per app copy. |
+| `CircuitBreakerFailureThreshold` | `3` | Consecutive failed updates before pausing refreshes. |
+| `CircuitBreakerOpenFor` | `00:05:00` | Time to pause refreshes before allowing one trial update. |
 
 Duration settings use `hh:mm:ss` (or a .NET `TimeSpan` string). Override them
 without editing code using environment variables, for example
@@ -118,15 +124,17 @@ shell before running the same `dotnet run` command. Environment variables
 override `appsettings.json`. Restart the app after changing a setting.
 
 All durations must be positive. `RefreshTimeout` must be at least
-`RequestTimeout`. The settings have upper bounds, and `MaxConcurrentRequests`
-must be between 1 and 32. Invalid settings prevent the app from starting.
+`RequestTimeout`, and `CircuitBreakerOpenFor` must be at least
+`RetryAfterFailure`. The settings have upper bounds, `MaxConcurrentRequests`
+must be between 1 and 32, and `CircuitBreakerFailureThreshold` must be between
+1 and 100. Invalid settings prevent the app from starting.
 Increasing concurrency or shortening the cache interval can raise the load on
-Hacker News, especially when running multiple app copies.
+Hacker News, especially when running multiple app copies. The circuit breaker
+is held in memory separately by each app copy, not shared between servers.
 
 ## Roadmap
 
 These items are ordered for a public deployment with one running copy of the app.
-The last two apply only if the deployment needs them.
 
 1. Add tests that call the API over HTTP.
    - Check successful responses, invalid input, errors when Hacker News is
@@ -144,7 +152,8 @@ The last two apply only if the deployment needs them.
      Hacker News but do not limit traffic coming into this app.
 4. Add monitoring, error reporting, and health checks.
    - Track failed Hacker News requests and how old the saved results are. Alert
-     if updates keep failing or the saved list becomes too old.
+     if updates keep failing, the circuit breaker opens, or the saved list
+     becomes too old.
    - Report unexpected app errors to a tool such as Sentry, so they can be
      investigated. Error reporting alone would not show a stopped update job.
    - Add a health check endpoint so the hosting platform can tell whether the
@@ -152,7 +161,12 @@ The last two apply only if the deployment needs them.
 5. Test how the app behaves with many callers at once, then tune the configurable
    cache times, timeouts, and concurrency limit if needed.
 6. Add OpenAPI documentation describing the API and its responses.
-7. If running more than one copy of the app, use one scheduled update job and
+
+### Optional / deployment-dependent
+
+These changes depend on how the API is deployed and who needs access.
+
+1. If running more than one copy of the app, use one scheduled update job and
    a shared cache such as Redis.
    - The job would fetch and sort stories every five minutes, then replace the
      whole saved list in the shared cache at once. All API copies would read
@@ -163,4 +177,4 @@ The last two apply only if the deployment needs them.
    - Keep the last good list when an update fails, monitor whether the job is
      running, and ensure only one job updates the list at a time. This approach
      does make scheduled updates even when there are no clients.
-8. If private access or limits per client are needed, add API keys or sign-in.
+2. If private access or limits per client are needed, add API keys or sign-in.

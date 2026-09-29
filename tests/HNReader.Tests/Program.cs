@@ -21,6 +21,9 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Configured cache and retry times", UsesConfiguredCacheTimes),
     ("Configured Hacker News request timeout", UsesConfiguredRequestTimeout),
     ("Configured overall update deadline", UsesConfiguredRefreshTimeout),
+    ("Circuit opens after consecutive failures and resets after recovery", OpensCircuitAndRecovers),
+    ("Open circuit serves only usable saved results", ServesStaleWhileCircuitIsOpen),
+    ("Failed half-open trial reopens the circuit for waiting callers", FailedTrialReopensCircuit),
     ("Rejects invalid n", RejectsInvalidN)
 };
 
@@ -49,7 +52,9 @@ static BestStoriesOptions DefaultOptions() => new()
     RetryAfterFailure = TimeSpan.FromMinutes(1),
     RequestTimeout = TimeSpan.FromSeconds(10),
     RefreshTimeout = TimeSpan.FromSeconds(30),
-    MaxConcurrentRequests = 8
+    MaxConcurrentRequests = 8,
+    CircuitBreakerFailureThreshold = 3,
+    CircuitBreakerOpenFor = TimeSpan.FromMinutes(5)
 };
 
 static BestStoriesService CreateService(StubHandler handler, ManualClock? clock = null, BestStoriesOptions? settings = null)
@@ -395,6 +400,120 @@ static async Task UsesConfiguredRefreshTimeout()
     var error = await ExpectUnavailable(service).WaitAsync(TimeSpan.FromSeconds(3));
     Check(error.InnerException is OperationCanceledException && handler.Calls == 3,
         "RefreshTimeout should stop the whole update even when individual requests are fast enough");
+}
+
+static async Task OpensCircuitAndRecovers()
+{
+    var settings = DefaultOptions();
+    settings.FreshFor = TimeSpan.FromSeconds(2);
+    settings.StaleFor = TimeSpan.FromSeconds(8);
+    settings.RetryAfterFailure = TimeSpan.FromSeconds(1);
+    settings.CircuitBreakerFailureThreshold = 2;
+    settings.CircuitBreakerOpenFor = TimeSpan.FromSeconds(5);
+    var clock = new ManualClock();
+    var unavailable = false;
+    using var handler = new StubHandler((path, _) => unavailable
+        ? throw new HttpRequestException("Hacker News unavailable")
+        : Task.FromResult(StubHandler.Json(path.EndsWith("beststories.json") ? "[1]" : StubHandler.Story(10, "Saved"))));
+    var service = CreateService(handler, clock, settings);
+    await service.GetBestStoriesAsync(1);
+    unavailable = true;
+    clock.Advance(TimeSpan.FromSeconds(3));
+    Check((await service.GetBestStoriesAsync(1))[0].Title == "Saved" && handler.Calls == 3,
+        "First failure should serve saved results");
+    clock.Advance(TimeSpan.FromSeconds(1));
+    Check((await service.GetBestStoriesAsync(1))[0].Title == "Saved" && handler.Calls == 4,
+        "Second failure should open the circuit");
+    clock.Advance(TimeSpan.FromSeconds(2));
+    Check((await service.GetBestStoriesAsync(1))[0].Title == "Saved" && handler.Calls == 4,
+        "Open circuit should make no Hacker News requests");
+
+    unavailable = false;
+    clock.Advance(TimeSpan.FromSeconds(3));
+    Check((await service.GetBestStoriesAsync(1))[0].Title == "Saved" && handler.Calls == 6,
+        "One successful trial should close the circuit");
+    unavailable = true;
+    clock.Advance(TimeSpan.FromSeconds(2));
+    await service.GetBestStoriesAsync(1);
+    Check(handler.Calls == 7, "One failure after recovery must not reopen the circuit");
+    clock.Advance(TimeSpan.FromSeconds(1));
+    await service.GetBestStoriesAsync(1);
+    Check(handler.Calls == 8, "Two consecutive failures after recovery should reopen the circuit");
+    clock.Advance(TimeSpan.FromSeconds(1));
+    await service.GetBestStoriesAsync(1);
+    Check(handler.Calls == 8, "Reopened circuit should block another update");
+}
+
+static async Task ServesStaleWhileCircuitIsOpen()
+{
+    var settings = DefaultOptions();
+    settings.FreshFor = TimeSpan.FromSeconds(1);
+    settings.StaleFor = TimeSpan.FromSeconds(2);
+    settings.RetryAfterFailure = TimeSpan.FromSeconds(1);
+    settings.CircuitBreakerFailureThreshold = 1;
+    settings.CircuitBreakerOpenFor = TimeSpan.FromSeconds(5);
+    var clock = new ManualClock();
+    var unavailable = false;
+    using var handler = new StubHandler((path, _) => unavailable
+        ? throw new HttpRequestException("Hacker News unavailable")
+        : Task.FromResult(StubHandler.Json(path.EndsWith("beststories.json") ? "[1]" : StubHandler.Story(10, "Saved"))));
+    var service = CreateService(handler, clock, settings);
+    await service.GetBestStoriesAsync(1);
+    unavailable = true;
+    clock.Advance(TimeSpan.FromSeconds(2));
+    Check((await service.GetBestStoriesAsync(1))[0].Title == "Saved" && handler.Calls == 3,
+        "Failed update should return saved results and open the circuit");
+    clock.Advance(TimeSpan.FromSeconds(2));
+    var error = await ExpectUnavailable(service);
+    Check(error.Message.Contains("paused", StringComparison.OrdinalIgnoreCase) && handler.Calls == 3,
+        "Expired saved results should return 503 without fetching while open");
+    unavailable = false;
+    clock.Advance(TimeSpan.FromSeconds(3));
+    Check((await service.GetBestStoriesAsync(1))[0].Title == "Saved" && handler.Calls == 5,
+        "Breaker should allow one trial update when its open period ends");
+}
+
+static async Task FailedTrialReopensCircuit()
+{
+    var settings = DefaultOptions();
+    settings.RetryAfterFailure = TimeSpan.FromSeconds(1);
+    settings.CircuitBreakerFailureThreshold = 2;
+    settings.CircuitBreakerOpenFor = TimeSpan.FromSeconds(5);
+    var clock = new ManualClock();
+    var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var listCalls = 0;
+    using var handler = new StubHandler(async (path, token) =>
+    {
+        if (path.EndsWith("beststories.json") && Interlocked.Increment(ref listCalls) == 3)
+        {
+            started.TrySetResult();
+            await release.Task.WaitAsync(token);
+        }
+        throw new HttpRequestException("Hacker News unavailable");
+    });
+    var service = CreateService(handler, clock, settings);
+    await ExpectUnavailable(service);
+    clock.Advance(TimeSpan.FromSeconds(1));
+    await ExpectUnavailable(service);
+    Check(handler.Calls == 2, "Second failure should open the circuit");
+    clock.Advance(TimeSpan.FromSeconds(5));
+    var trial = ExpectUnavailable(service);
+    try
+    {
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var concurrent = ExpectUnavailable(service);
+        release.TrySetResult();
+        var trialError = await trial.WaitAsync(TimeSpan.FromSeconds(2));
+        var concurrentError = await concurrent.WaitAsync(TimeSpan.FromSeconds(2));
+        Check(trialError.InnerException is HttpRequestException &&
+            concurrentError.Message.Contains("paused", StringComparison.OrdinalIgnoreCase) && handler.Calls == 3,
+            "Failed trial should reopen the circuit without allowing a second trial");
+    }
+    finally { release.TrySetResult(); }
+    clock.Advance(TimeSpan.FromSeconds(4));
+    await ExpectUnavailable(service);
+    Check(handler.Calls == 3, "Failed trial should start a new full open period");
 }
 
 static async Task RejectsInvalidN()

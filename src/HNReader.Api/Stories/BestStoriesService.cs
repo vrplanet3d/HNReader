@@ -15,6 +15,8 @@ public sealed class BestStoriesService(
     private readonly SemaphoreSlim _refreshLock = new(1, 1);
     private Snapshot? _snapshot;
     private DateTimeOffset _nextAttempt;
+    private DateTimeOffset _circuitOpenUntil;
+    private int _consecutiveFailures;
 
     public async Task<IReadOnlyList<BestStory>> GetBestStoriesAsync(int n, CancellationToken cancellationToken = default)
     {
@@ -34,6 +36,13 @@ public sealed class BestStoriesService(
             if (snapshot?.FreshUntil > now)
                 return snapshot.Stories.Take(n).ToArray();
 
+            if (now < _circuitOpenUntil)
+            {
+                if (snapshot?.StaleUntil > now)
+                    return snapshot.Stories.Take(n).ToArray();
+                throw new HackerNewsUnavailableException("Hacker News updates are paused after repeated failures.");
+            }
+
             if (now < _nextAttempt)
             {
                 if (snapshot?.StaleUntil > now)
@@ -47,12 +56,21 @@ public sealed class BestStoriesService(
                 now = clock.GetUtcNow();
                 snapshot = new Snapshot(stories, now + _settings.FreshFor, now + _settings.FreshFor + _settings.StaleFor);
                 Volatile.Write(ref _snapshot, snapshot);
+                _consecutiveFailures = 0;
+                _circuitOpenUntil = default;
                 return stories.Take(n).ToArray();
             }
             catch (Exception ex) when (ex is HttpRequestException or JsonException or OperationCanceledException)
             {
                 now = clock.GetUtcNow();
                 _nextAttempt = now + _settings.RetryAfterFailure;
+                if (_consecutiveFailures < _settings.CircuitBreakerFailureThreshold)
+                    _consecutiveFailures++;
+                if (_consecutiveFailures >= _settings.CircuitBreakerFailureThreshold)
+                {
+                    _circuitOpenUntil = now + _settings.CircuitBreakerOpenFor;
+                    logger.LogWarning("Hacker News circuit breaker opened until {OpenUntil}", _circuitOpenUntil);
+                }
                 logger.LogWarning(ex, "Unable to refresh Hacker News best stories");
                 if (snapshot?.StaleUntil > now)
                     return snapshot.Stories.Take(n).ToArray();
